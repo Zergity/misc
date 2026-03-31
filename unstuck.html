@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Unstuck Transaction</title>
+<style>
+  body { font-family: monospace; max-width: 600px; margin: 40px auto; padding: 0 20px; background: #1a1a2e; color: #e0e0e0; }
+  h1 { font-size: 1.3em; color: #fff; }
+  .field { margin: 10px 0; }
+  .field label { color: #888; display: block; margin-bottom: 4px; font-size: 0.85em; }
+  .field input { background: #16213e; color: #4fc3f7; border: 1px solid #333; padding: 8px; border-radius: 4px; font-family: monospace; font-size: 0.9em; width: 100%; box-sizing: border-box; }
+  button { background: #0f3460; color: #fff; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-family: monospace; font-size: 1em; margin: 6px 4px 6px 0; }
+  button:hover { background: #1a5276; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #log { background: #0f0f23; padding: 12px; border-radius: 6px; margin-top: 16px; min-height: 60px; max-height: 300px; overflow-y: auto; font-size: 0.85em; white-space: pre-wrap; }
+  .ok { color: #66bb6a; }
+  .err { color: #ef5350; }
+  .warn { color: #ffa726; }
+  .info { color: #4fc3f7; }
+</style>
+</head>
+<body>
+
+<h1>Unstuck Transaction</h1>
+<p style="color:#888;font-size:0.85em;">Sends a 0-value self-transfer with the same nonce to replace a stuck tx.</p>
+
+<div class="field">
+  <label>Stuck Transaction Hash (optional — auto-detects nonce)</label>
+  <input id="txHash" placeholder="0x..." />
+</div>
+<div class="field">
+  <label>Or enter Nonce manually</label>
+  <input id="nonce" type="number" placeholder="Leave empty to auto-detect from tx hash or pending nonce" />
+</div>
+<div class="field">
+  <label>Replacement Tx Type</label>
+  <select id="txType">
+    <option value="auto" selected>Auto (match stuck tx)</option>
+    <option value="legacy">Legacy (gasPrice)</option>
+    <option value="eip1559">EIP-1559 (maxFeePerGas + maxPriorityFeePerGas)</option>
+  </select>
+</div>
+<div id="legacyFees" class="field">
+  <label>gasPrice (gwei)</label>
+  <input id="gasPrice" type="text" placeholder="auto 2x bump if empty" />
+</div>
+<div id="eip1559Fees" class="field" style="display:none;">
+  <label>maxFeePerGas (gwei)</label>
+  <input id="maxFeePerGas" type="text" placeholder="auto 2x bump if empty" />
+  <label style="margin-top:6px;">maxPriorityFeePerGas (gwei)</label>
+  <input id="maxPriorityFeePerGas" type="text" placeholder="auto 2x bump if empty" />
+</div>
+
+<div style="margin-top:16px;">
+  <button onclick="connectAndDetect()">Connect & Detect</button>
+  <button id="btnSend" onclick="sendReplacement()" disabled>Send Replacement Tx</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+let provider = null;
+let account = null;
+
+// Toggle fee fields based on tx type selection
+document.getElementById('txType').addEventListener('change', updateFeeFields);
+function updateFeeFields() {
+  const v = document.getElementById('txType').value;
+  const isEip1559 = v === 'eip1559' || (v === 'auto' && document.getElementById('eip1559Fees').dataset.autoDetected === '1');
+  document.getElementById('legacyFees').style.display = isEip1559 ? 'none' : '';
+  document.getElementById('eip1559Fees').style.display = isEip1559 ? '' : 'none';
+}
+
+function log(msg, cls) {
+  const el = document.getElementById('log');
+  const line = document.createElement('div');
+  line.className = cls || '';
+  line.textContent = msg;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+function clearLog() {
+  document.getElementById('log').innerHTML = '';
+}
+
+async function connectAndDetect() {
+  clearLog();
+  if (!window.ethereum) { log('No browser wallet detected.', 'err'); return; }
+
+  try {
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    provider = window.ethereum;
+    account = accounts[0];
+    log('Connected: ' + account, 'ok');
+
+    const chainId = await provider.request({ method: 'eth_chainId' });
+    log('Chain ID: ' + parseInt(chainId, 16), 'info');
+
+    await scanPendingTxs();
+
+    document.getElementById('btnSend').disabled = false;
+  } catch (e) {
+    log('Error: ' + e.message, 'err');
+  }
+}
+
+const typeNames = { '0x0': 'legacy', '0x1': 'EIP-2930', '0x2': 'EIP-1559' };
+
+function logTx(tx) {
+  const txType = tx.type || '0x0';
+  log('  Nonce: ' + parseInt(tx.nonce, 16), 'info');
+  log('  Hash: ' + tx.hash, 'info');
+  log('  To: ' + (tx.to || '(contract creation)'), 'info');
+  log('  Value: ' + (Number(BigInt(tx.value || '0x0')) / 1e18) + ' ETH', 'info');
+  log('  Type: ' + txType + ' (' + (typeNames[txType] || 'unknown') + ')', 'info');
+  if (tx.gasPrice) log('  gasPrice: ' + (Number(BigInt(tx.gasPrice)) / 1e9).toFixed(4) + ' gwei', 'info');
+  if (tx.maxFeePerGas) log('  maxFeePerGas: ' + (Number(BigInt(tx.maxFeePerGas)) / 1e9).toFixed(4) + ' gwei', 'info');
+  if (tx.maxPriorityFeePerGas) log('  maxPriorityFeePerGas: ' + (Number(BigInt(tx.maxPriorityFeePerGas)) / 1e9).toFixed(4) + ' gwei', 'info');
+
+  // Fill fee inputs with stuck tx values
+  const isEip1559 = txType === '0x2' || tx.maxFeePerGas;
+  if (isEip1559) {
+    document.getElementById('eip1559Fees').dataset.autoDetected = '1';
+    if (tx.maxFeePerGas) document.getElementById('maxFeePerGas').value = (Number(BigInt(tx.maxFeePerGas)) / 1e9).toFixed(4);
+    if (tx.maxPriorityFeePerGas) document.getElementById('maxPriorityFeePerGas').value = (Number(BigInt(tx.maxPriorityFeePerGas)) / 1e9).toFixed(4);
+  } else {
+    document.getElementById('eip1559Fees').dataset.autoDetected = '0';
+    if (tx.gasPrice) document.getElementById('gasPrice').value = (Number(BigInt(tx.gasPrice)) / 1e9).toFixed(4);
+  }
+  updateFeeFields();
+}
+
+async function scanPendingTxs() {
+  const pendingNonce = await provider.request({ method: 'eth_getTransactionCount', params: [account, 'pending'] });
+  const latestNonce = await provider.request({ method: 'eth_getTransactionCount', params: [account, 'latest'] });
+  const pending = parseInt(pendingNonce, 16);
+  const latest = parseInt(latestNonce, 16);
+
+  log('Latest confirmed nonce: ' + latest, 'info');
+  log('Pending nonce: ' + pending, 'info');
+
+  if (pending <= latest) {
+    log('No stuck/pending transactions detected.', 'ok');
+
+    // Still check if user provided a tx hash
+    const txHash = document.getElementById('txHash').value.trim();
+    if (txHash) {
+      log('\nLooking up provided tx...');
+      const tx = await provider.request({ method: 'eth_getTransactionByHash', params: [txHash] });
+      if (tx) {
+        logTx(tx);
+        log('  Status: ' + (tx.blockNumber ? 'mined (block ' + parseInt(tx.blockNumber, 16) + ')' : 'PENDING'), tx.blockNumber ? 'warn' : 'err');
+      } else {
+        log('  Tx not found — may have been dropped.', 'warn');
+      }
+    }
+    return;
+  }
+
+  const stuckCount = pending - latest;
+  log('\nFound ' + stuckCount + ' pending transaction(s):', 'warn');
+
+  // Try to fetch each pending tx by scanning via txpool or by hash lookup
+  // Most nodes support eth_getTransactionByHash for pending txs
+  // We'll also try the user-provided hash
+  const foundTxs = [];
+  const txHash = document.getElementById('txHash').value.trim();
+
+  // Try user-provided tx hash first
+  if (txHash) {
+    const tx = await provider.request({ method: 'eth_getTransactionByHash', params: [txHash] });
+    if (tx && !tx.blockNumber) {
+      foundTxs.push(tx);
+    }
+  }
+
+  // Try txpool_content if available (some nodes support it)
+  try {
+    const txpool = await provider.request({ method: 'txpool_content' });
+    if (txpool && txpool.pending && txpool.pending[account.toLowerCase()]) {
+      const pendingTxs = txpool.pending[account.toLowerCase()];
+      for (const n of Object.keys(pendingTxs).sort((a, b) => Number(a) - Number(b))) {
+        const tx = pendingTxs[n];
+        if (!foundTxs.find(t => t.hash === tx.hash)) {
+          foundTxs.push(tx);
+        }
+      }
+    }
+  } catch (e) {
+    // txpool_content not supported, that's fine
+  }
+
+  if (foundTxs.length === 0) {
+    log('Could not fetch pending tx details (node may not expose them).', 'warn');
+    log('Stuck nonces: ' + latest + ' to ' + (pending - 1), 'warn');
+  } else {
+    for (const tx of foundTxs) {
+      log('\n--- Pending TX ---', 'err');
+      logTx(tx);
+    }
+  }
+
+  // Set nonce to first stuck one
+  document.getElementById('nonce').value = latest;
+  log('\nFirst stuck nonce: ' + latest, 'ok');
+}
+
+async function sendReplacement() {
+  if (!provider || !account) { log('Connect wallet first.', 'err'); return; }
+
+  const nonceInput = document.getElementById('nonce').value;
+  if (!nonceInput && nonceInput !== '0') { log('Nonce is required.', 'err'); return; }
+  const nonce = '0x' + parseInt(nonceInput).toString(16);
+
+  log('Detecting gas price...');
+
+  try {
+    // Detect stuck tx gas params to build a proper replacement
+    let txParams = { from: account, to: account, value: '0x0', nonce: nonce };
+
+    const txHash0 = document.getElementById('txHash').value.trim();
+    let stuckTx = null;
+    if (txHash0) {
+      stuckTx = await provider.request({ method: 'eth_getTransactionByHash', params: [txHash0] });
+    }
+
+    const txTypeChoice = document.getElementById('txType').value;
+    const isEip1559 = txTypeChoice === 'eip1559' ||
+      (txTypeChoice === 'auto' && stuckTx && (stuckTx.type === '0x2' || stuckTx.maxFeePerGas));
+
+    if (isEip1559) {
+      const maxFeeStr = document.getElementById('maxFeePerGas').value.trim();
+      const priorityStr = document.getElementById('maxPriorityFeePerGas').value.trim();
+
+      let newMaxFee, newPriority;
+      if (maxFeeStr) {
+        newMaxFee = BigInt(Math.round(parseFloat(maxFeeStr) * 1e9));
+        log('Using manual maxFeePerGas: ' + maxFeeStr + ' gwei', 'warn');
+      } else {
+        const currentGasPrice = await provider.request({ method: 'eth_gasPrice' });
+        const baseMaxFee = stuckTx && stuckTx.maxFeePerGas ? BigInt(stuckTx.maxFeePerGas) : BigInt(currentGasPrice);
+        newMaxFee = baseMaxFee * 2n + 1n;
+        log('Auto 2x maxFeePerGas from ' + (Number(baseMaxFee) / 1e9).toFixed(4) + ' gwei', 'info');
+      }
+      if (priorityStr) {
+        newPriority = BigInt(Math.round(parseFloat(priorityStr) * 1e9));
+        log('Using manual maxPriorityFeePerGas: ' + priorityStr + ' gwei', 'warn');
+      } else {
+        const currentGasPrice = await provider.request({ method: 'eth_gasPrice' });
+        const basePriority = stuckTx && stuckTx.maxPriorityFeePerGas ? BigInt(stuckTx.maxPriorityFeePerGas) : BigInt(currentGasPrice) / 10n;
+        newPriority = basePriority * 2n + 1n;
+        log('Auto 2x maxPriorityFeePerGas from ' + (Number(basePriority) / 1e9).toFixed(4) + ' gwei', 'info');
+      }
+
+      txParams.type = '0x2';
+      txParams.maxFeePerGas = '0x' + newMaxFee.toString(16);
+      txParams.maxPriorityFeePerGas = '0x' + newPriority.toString(16);
+      log('Replacement type: EIP-1559', 'info');
+      log('maxFeePerGas: ' + (Number(newMaxFee) / 1e9).toFixed(4) + ' gwei', 'info');
+      log('maxPriorityFeePerGas: ' + (Number(newPriority) / 1e9).toFixed(4) + ' gwei', 'info');
+    } else {
+      const gasPriceStr = document.getElementById('gasPrice').value.trim();
+      let gasPrice;
+      if (gasPriceStr) {
+        gasPrice = BigInt(Math.round(parseFloat(gasPriceStr) * 1e9));
+        log('Using manual gasPrice: ' + gasPriceStr + ' gwei', 'warn');
+      } else {
+        const currentGasPrice = await provider.request({ method: 'eth_gasPrice' });
+        gasPrice = BigInt(currentGasPrice) * 2n;
+        if (stuckTx) {
+          const stuckGas = BigInt(stuckTx.gasPrice || '0x0');
+          const minGas = stuckGas * 2n + 1n;
+          if (gasPrice < minGas) gasPrice = minGas;
+          log('Auto 2x gasPrice from ' + (Number(stuckGas) / 1e9).toFixed(4) + ' gwei', 'info');
+        }
+      }
+      txParams.gasPrice = '0x' + gasPrice.toString(16);
+      log('Replacement type: legacy', 'info');
+      log('gasPrice: ' + (Number(gasPrice) / 1e9).toFixed(4) + ' gwei', 'info');
+    }
+
+    log('Sending 0-value self-transfer with nonce ' + parseInt(nonceInput) + '...');
+
+    const txHash = await provider.request({
+      method: 'eth_sendTransaction',
+      params: [txParams]
+    });
+
+    log('Replacement tx sent: ' + txHash, 'ok');
+    log('Waiting for confirmation...');
+
+    for (let i = 0; i < 120; i++) {
+      const receipt = await provider.request({ method: 'eth_getTransactionReceipt', params: [txHash] });
+      if (receipt) {
+        if (receipt.status === '0x1') {
+          log('Confirmed! Stuck tx replaced.', 'ok');
+        } else {
+          log('Tx reverted (status 0x0) — but nonce is freed.', 'warn');
+        }
+        return;
+      }
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    log('Timed out waiting for confirmation.', 'warn');
+  } catch (e) {
+    log('Error: ' + e.message, 'err');
+  }
+}
+</script>
+</body>
+</html>
